@@ -11,6 +11,8 @@ from ScopeFoundry import h5_io
 import numpy as np
 import time
 from ScopeFoundry.helper_funcs import load_qt_ui_file, sibling_path
+from skimage.feature.register_translation import _upsampled_dft, _compute_error, _compute_phasediff
+from copy import copy, deepcopy
 
 class SyncRasterScan(BaseRaster2DScan):
 
@@ -31,7 +33,11 @@ class SyncRasterScan(BaseRaster2DScan):
                             vmin=1, vmax=1e10,
                             unit='x')
         self.disp_chan_choices = ['adc0', 'adc1', 'ctr0', 'ctr1'] 
-        self.settings.New("display_chan", dtype=str, initial='adc0', choices=tuple(self.disp_chan_choices))        
+        self.settings.New("display_chan", dtype=str, initial='adc0', choices=tuple(self.disp_chan_choices))
+        self.settings.New("correct_drift", dtype=bool, initial=False)        
+        self.settings.New("correlation_exp", dtype=float, initial=0.3, vmin=0., vmax=1.)
+        self.settings.New("proportional_gain", dtype=float, initial=0.3, vmin=0.)
+        self.settings.New('current_drift', dtype=float,array=True, ro=True, si=True, unit='px')
         
         self.scanDAQ = self.app.hardware['sync_raster_daq']        
         self.scan_on=False
@@ -51,7 +57,11 @@ class SyncRasterScan(BaseRaster2DScan):
         
         if hasattr(self.app,'sem_remcon'):#FIX re-implement later
             self.sem_remcon=self.app.sem_remcon
-    
+        
+        # Initialize quantities for real-time drift correction
+        
+        
+        
 #     def dock_config(self):
 #         
 #         del self.ui.plot_groupBox
@@ -77,6 +87,9 @@ class SyncRasterScan(BaseRaster2DScan):
             time.sleep(0.2)
             
         self.scanDAQ.settings['adc_oversample'] = self.settings['adc_oversample']
+        
+        # READ FROM HARDWARE BEFORE SCANNING -- Drift correction depends on accurate numbers
+        self.app.hardware['sem_remcon'].read_from_hardware()
 
         # Compute data arrays        
         self.log.debug( "computing scan arrays")
@@ -87,7 +100,14 @@ class SyncRasterScan(BaseRaster2DScan):
         
         self.display_image_map = np.zeros(self.scan_shape, dtype=float)
     
-    
+        # Initialize quantities for drift correction
+        self.win = np.outer(np.hanning(self.settings['Nv']),np.hanning(self.settings['Nh']))
+        self.correct_chan = 1 # NOTE: This should be an lq in case one detector or the other doesn't work
+        self.drift = [0, 0] # Defined as [y, x] vector
+        self.shift_factor_h = 5.495 # beam shift % / um: Calibrated at WD = 10.1 mm
+        self.shift_factor_v = 4.831 # beam shift % / um: Calibrated at WD = 10.1 mm
+        self.beam_shift = list(self.app.hardware['sem_remcon'].settings['beamshift_xy'])
+        self.images = np.zeros((self.settings['Nv'],self.settings['Nh'],2))
         
         """        #Connect to RemCon and turn on External Scan for SEM
                 if hasattr(self,"sem_remcon"):
@@ -151,9 +171,10 @@ class SyncRasterScan(BaseRaster2DScan):
             #self.pixels_remaining = self.Npixels # in frame
             self.new_adc_data_queue = [] # will contain numpy arrays (data blocks) from adc to be processed
             self.adc_map = np.zeros(self.scan_shape + (self.scanDAQ.adc_chan_count,), dtype=float)
+            
             adc_chunk_size = (1,1, max(1,num_pixels_per_block/self.Nh.val), self.Nh.val ,self.scanDAQ.adc_chan_count )
             print('adc_chunk_size', adc_chunk_size)
-            self.adc_map_h5 = self.create_h5_framed_dataset('adc_map', self.adc_map, chunks=adc_chunk_size, compression='gzip')
+            self.adc_map_h5 = self.create_h5_framed_dataset('adc_map', self.adc_map, chunks=adc_chunk_size, compression=None)
                     
             # Ctr
             # ctr_pixel_index contains index of next pixel to be processed, 
@@ -166,7 +187,7 @@ class SyncRasterScan(BaseRaster2DScan):
             self.ctr_map_Hz = np.zeros(self.ctr_map.shape, dtype=float)
             ctr_chunk_size = (1,1, max(1,num_pixels_per_block/self.Nh.val), self.Nh.val, self.scanDAQ.num_ctrs)
             print('ctr_chunk_size', ctr_chunk_size)
-            self.ctr_map_h5 = self.create_h5_framed_dataset('ctr_map', self.ctr_map, chunks=ctr_chunk_size, compression='gzip')
+            self.ctr_map_h5 = self.create_h5_framed_dataset('ctr_map', self.ctr_map, chunks=ctr_chunk_size, compression=None)
                         
             ##### register callbacks
             self.scanDAQ.set_adc_n_pixel_callback(
@@ -312,7 +333,45 @@ class SyncRasterScan(BaseRaster2DScan):
         pass
     
     def on_end_frame(self, frame_i):
-        pass
+        if self.settings['correct_drift']:
+            frame_num = (self.total_pixel_index // self.Npixels) - 1
+            print('frame_num',frame_num)
+            if frame_num == 0:
+                #Reference image
+                self.images[:,:,0] = self.adc_map[0,:,:,self.correct_chan]
+            else:
+                #Offset image
+                self.images[:,:,1] = self.adc_map[0,:,:,self.correct_chan] #assumes no subframes
+            
+            if frame_num > 0:
+                # Shift determination
+                shift, error, diffphase = self.register_translation_hybrid(self.images[:,:,0]*self.win, self.images[:,:,1]*self.win, 
+                                                                           exponent = self.settings['correlation_exp'], upsample_factor = 100)
+                print('Image shift [px]', shift)
+                # Shift defined as [y, x] vector in direction of motion of view relative to sample
+                # pos x shifts view to the right
+                # pos y shifts view upwards
+                
+                # Calculate beam shift [x, y]
+                # pos x shifts view to the left
+                # pos y shifts view upwards
+                full_size = self.app.hardware['sem_remcon'].settings['full_size'] * 10**6
+                scan_size_h = ((self.settings['h1']-self.settings['h0'])/20.0) * full_size
+                scan_size_v = ((self.settings['v1']-self.settings['v0'])/20.0) * full_size
+                print('Scan size [um]',(scan_size_h, scan_size_v))
+                # x beam shift
+                self.beam_shift[0] = self.settings['proportional_gain'] * shift[1] * self.shift_factor_h * (scan_size_h/self.settings['Nh'])
+                # y beam shift
+                self.beam_shift[1] = -1 * self.settings['proportional_gain'] * shift[0] * self.shift_factor_v * (scan_size_v/self.settings['Nv'])
+                print('Beam Shift [%]', self.beam_shift)
+                self.app.hardware['sem_remcon'].settings['beamshift_xy'] = self.beam_shift
+                
+                # Wait for beam shift to adjust (didn't seem to actually pause scanning)
+                # time.sleep(2)
+                
+                # other option
+                # self.app.hardware['sem_remcon'].settings.beamshift_xy.update_value(self.beam_shift)
+                # print('Hardware Shift? [%]', self.app.hardware['sem_remcon'].settings['beamshift_xy'])
 
     def on_new_ctr_data(self, ctr_i, new_data):
         #print("on_new_ctr_data {} {}".format(ctr_i, new_data))
@@ -420,3 +479,139 @@ class SyncRasterScan(BaseRaster2DScan):
         if hasattr(self, 'scanDAQ'):
             self.settings['pixel_time'] = 1.0/self.scanDAQ.settings['dac_rate']
         BaseRaster2DScan.compute_times(self)
+
+    def register_translation_hybrid(self, src_image, target_image, exponent = 1, upsample_factor=1,
+                         space="real"):
+        """
+        Efficient subpixel image translation registration by hybrid-correlation (cross and phase).
+        Exponent = 1 -> cross correlation, exponent = 0 -> phase correlation.
+        Closer to zero is more precise but more susceptible to noise.
+        
+        This code gives the same precision as the FFT upsampled correlation
+        in a fraction of the computation time and with reduced memory requirements.
+        It obtains an initial estimate of the cross-correlation peak by an FFT and
+        then refines the shift estimation by upsampling the DFT only in a small
+        neighborhood of that estimate by means of a matrix-multiply DFT.
+    
+        Parameters
+        ----------
+        src_image : ndarray
+            Reference image.
+        target_image : ndarray
+            Image to register.  Must be same dimensionality as ``src_image``.
+        exponent: float, optional
+            Power to which amplitude contribution to correlation is raised.
+            exponent = 0: Phase correlation
+            exponent = 1: Cross correlation
+            0 < exponent < 1 = Hybrid
+        upsample_factor : int, optional
+            Upsampling factor. Images will be registered to within
+            ``1 / upsample_factor`` of a pixel. For example
+            ``upsample_factor == 20`` means the images will be registered
+            within 1/20th of a pixel.  Default is 1 (no upsampling)
+        space : string, one of "real" or "fourier"
+            Defines how the algorithm interprets input data.  "real" means data
+            will be FFT'd to compute the correlation, while "fourier" data will
+            bypass FFT of input data.  Case insensitive.
+    
+        Returns
+        -------
+        shifts : ndarray
+            Shift vector (in pixels) required to register ``target_image`` with
+            ``src_image``.  Axis ordering is consistent with numpy (e.g. Z, Y, X)
+        error : float
+            Translation invariant normalized RMS error between ``src_image`` and
+            ``target_image``.
+        phasediff : float
+            Global phase difference between the two images (should be
+            zero if images are non-negative).
+    
+        References
+        ----------
+        .. [1] Manuel Guizar-Sicairos, Samuel T. Thurman, and James R. Fienup,
+               "Efficient subpixel image registration algorithms,"
+               Optics Letters 33, 156-158 (2008).
+        """
+        # images must be the same shape
+        if src_image.shape != target_image.shape:
+            raise ValueError("Error: images must be same size for "
+                             "register_translation")
+    
+        # only 2D data makes sense right now
+        if src_image.ndim != 2 and upsample_factor > 1:
+            raise NotImplementedError("Error: register_translation only supports "
+                                      "subpixel registration for 2D images")
+    
+        # assume complex data is already in Fourier space
+        if space.lower() == 'fourier':
+            src_freq = src_image
+            target_freq = target_image
+        # real data needs to be fft'd.
+        elif space.lower() == 'real':
+            src_image = np.array(src_image, dtype=np.complex128, copy=False)
+            target_image = np.array(target_image, dtype=np.complex128, copy=False)
+            src_freq = np.fft.fftn(src_image)
+            target_freq = np.fft.fftn(target_image)
+        else:
+            raise ValueError("Error: register_translation only knows the \"real\" "
+                             "and \"fourier\" values for the ``space`` argument.")
+    
+        # Whole-pixel shift - Compute hybrid-correlation by an IFFT
+        shape = src_freq.shape
+        image_product = src_freq * target_freq.conj()
+        amplitude = np.abs(image_product)
+        phase = np.angle(image_product)
+        total_fourier = amplitude**exponent * np.exp(phase * 1j)
+        correlation = np.fft.ifftn(total_fourier)
+    
+        # Locate maximum
+        maxima = np.unravel_index(np.argmax(np.abs(correlation)),
+                                  correlation.shape)
+        midpoints = np.array([np.fix(axis_size / 2) for axis_size in shape])
+    
+        shifts = np.array(maxima, dtype=np.float64)
+        shifts[shifts > midpoints] -= np.array(shape)[shifts > midpoints]
+    
+        if upsample_factor == 1:
+            src_amp = np.sum(np.abs(src_freq) ** 2) / src_freq.size
+            target_amp = np.sum(np.abs(target_freq) ** 2) / target_freq.size
+            CCmax = correlation.max()
+        # If upsampling > 1, then refine estimate with matrix multiply DFT
+        else:
+            # Initial shift estimate in upsampled grid
+            shifts = np.round(shifts * upsample_factor) / upsample_factor
+            upsampled_region_size = np.ceil(upsample_factor * 1.5)
+            # Center of output array at dftshift + 1
+            dftshift = np.fix(upsampled_region_size / 2.0)
+            upsample_factor = np.array(upsample_factor, dtype=np.float64)
+            normalization = (src_freq.size * upsample_factor ** 2)
+            # Matrix multiply DFT around the current shift estimate
+            sample_region_offset = dftshift - shifts*upsample_factor
+            correlation = _upsampled_dft(total_fourier.conj(),
+                                               upsampled_region_size,
+                                               upsample_factor,
+                                               sample_region_offset).conj()
+            correlation /= normalization
+            # Locate maximum and map back to original pixel grid
+            maxima = np.array(np.unravel_index(
+                                  np.argmax(np.abs(correlation)),
+                                  correlation.shape),
+                              dtype=np.float64)
+            maxima -= dftshift
+            shifts = shifts + maxima / upsample_factor
+            CCmax = correlation.max()
+            src_amp = _upsampled_dft(src_freq * src_freq.conj(),
+                                     1, upsample_factor)[0, 0]
+            src_amp /= normalization
+            target_amp = _upsampled_dft(target_freq * target_freq.conj(),
+                                        1, upsample_factor)[0, 0]
+            target_amp /= normalization
+    
+        # If its only one row or column the shift along that dimension has no
+        # effect. We set to zero.
+        for dim in range(src_freq.ndim):
+            if shape[dim] == 1:
+                shifts[dim] = 0
+    
+        return shifts, _compute_error(CCmax, src_amp, target_amp),\
+            _compute_phasediff(CCmax)
