@@ -12,7 +12,8 @@ import numpy as np
 import time
 from ScopeFoundry.helper_funcs import load_qt_ui_file, sibling_path
 from skimage.feature.register_translation import _upsampled_dft, _compute_error, _compute_phasediff
-from copy import copy, deepcopy
+from ctypes import c_int32, c_uint32, c_uint64, byref
+import PyDAQmx as mx
 
 class SyncRasterScan(BaseRaster2DScan):
 
@@ -77,9 +78,12 @@ class SyncRasterScan(BaseRaster2DScan):
 #     WIP
     
     def run(self):
+        
+        self.in_dac_callback = False #make sure callback completes in time
+        
         # if hardware is not connected, connect it
+        time.sleep(0.5)
         if not self.scanDAQ.settings['connected']:
-            #self.scanDAQ.connect()
             self.scanDAQ.settings['connected'] = True
             #self.app.qtapp.processEvents()
             # we need to wait while the task is created before 
@@ -92,28 +96,28 @@ class SyncRasterScan(BaseRaster2DScan):
         self.app.hardware['sem_remcon'].read_from_hardware()
 
         # Compute data arrays        
-        self.log.debug( "computing scan arrays")
+        #self.log.debug( "computing scan arrays")
         self.compute_scan_arrays()
-        self.log.debug( "computing scan arrays... done")
+        #self.log.debug( "computing scan arrays... done")
         
-        self.initial_scan_setup_plotting = True
-        
+        self.initial_scan_setup_plotting = True        
         self.display_image_map = np.zeros(self.scan_shape, dtype=float)
     
-        # Initialize quantities for drift correction
+            # Initialize quantities for drift correction
         self.win = np.outer(np.hanning(self.settings['Nv']),np.hanning(self.settings['Nh']))
         self.correct_chan = 1 # NOTE: This should be an lq in case one detector or the other doesn't work
         self.drift = [0, 0] # Defined as [y, x] vector
+            #WIP will soon update scan position with DAC xy array..
         self.shift_factor_h = 5.495 # beam shift % / um: Calibrated at WD = 10.1 mm
         self.shift_factor_v = 4.831 # beam shift % / um: Calibrated at WD = 10.1 mm
         self.beam_shift = list(self.app.hardware['sem_remcon'].settings['beamshift_xy'])
         self.images = np.zeros((self.settings['Nv'],self.settings['Nh'],2))
         
-        """        #Connect to RemCon and turn on External Scan for SEM
-                if hasattr(self,"sem_remcon"):
-                    if self.sem_remcon.connected.val:
-                        self.sem_remcon.remcon.write_external_scan(1)
-                   
+            #Connect to RemCon and turn on External Scan for SEM
+        if hasattr(self,"sem_remcon"):
+            if self.sem_remcon.connected.val:
+                self.sem_remcon.remcon.write_external_scan(1)
+        """           
                 #self.setup_scale()
                 
                 if self.scanner.auto_blanking.val:
@@ -122,9 +126,6 @@ class SyncRasterScan(BaseRaster2DScan):
                             self.sem_remcon.remcon.write_beam_blanking(0)
         """                    
                         
-        # previously set samples_per_point in scanDAQ hardware
-               
-
         try:
             if self.settings['save_h5']:
                 self.h5_file = h5_io.h5_base_file(self.app, measurement=self)
@@ -140,29 +141,43 @@ class SyncRasterScan(BaseRaster2DScan):
             self.current_scan_index = self.scan_index_array[0]
             self.task_done = False
             
-            #### old get full image while blocking measurement thread
-            #self.ai_data = self.scanDAQ.single_scan_regular(self.scan_h_positions, -1*self.scan_v_positions)
-            #self.display_image_map[0,:,:] = self.ai_data[:,1].reshape(self.settings['Nv'], self.settings['Nh'])       
-            ####
             
             ##### load XY positions in to DAC
+            dac_taskhandle = self.scanDAQ.sync_analog_io.dac.task.taskHandle
+                #allow regen lets DAQ loop over scan buffer, do before task starts
+                #callbacks optionally dynamically update buffer for drift
+            mx.DAQmxSetWriteRegenMode(dac_taskhandle, mx.DAQmx_Val_AllowRegen)
+
+                #FIX kludge so python image matches SEM image
             self.scanDAQ.setup_io_with_data(self.scan_h_positions, -1*self.scan_v_positions)
+                #callback outputs this buffer, which may be adjusted by drift correction
+            self.new_XY = self.scanDAQ.XY.copy()
+
+
+            x_u32 = c_uint32()
+            mx.DAQmxGetWriteSpaceAvail(dac_taskhandle, byref(x_u32))
+            self.scanDAQ.buffer_size = x_u32
+            print("Initial DAQmxGetWriteSpaceAvail", x_u32.value)
+
             
-            ###### compute pixel acquisition block size 
-            # need at least one, and needs to an integer divisor of Npixels
+            ###### compute pixel acquisition block size FIX revisit for callbacks...
+            # need at least one, and needs to be an integer divisor of Npixels
             
-            num_pixels_per_block = max(1, int(np.ceil(self.display_update_period / self.scanDAQ.pixel_time)))
+            #num_pixels_per_block = max(1, int(np.ceil(25*self.display_update_period / self.scanDAQ.pixel_time)))
+            num_pixels_per_block = int(self.Npixels/4)
+                #force block to be an integer number of horizontal scan lines
             if num_pixels_per_block > self.Nh.val:
                 num_pixels_per_block = self.Nh.val*np.ceil( num_pixels_per_block / self.Nh.val )
-    
+                
             num_blocks = int(max(1, np.floor(self.Npixels / num_pixels_per_block)))
             
             while self.Npixels % num_blocks != 0:
                 num_blocks -= 1
                 #print("num_blocks", num_blocks)
-        
             self.num_pixels_per_block = num_pixels_per_block = int(self.Npixels / num_blocks)
             self.log.info("num_pixels_per_block {}".format( num_pixels_per_block))
+        
+            self.time_per_block = num_pixels_per_block * self.scanDAQ.pixel_time            
             
             ##### Data array
             # ADC
@@ -188,18 +203,28 @@ class SyncRasterScan(BaseRaster2DScan):
             ctr_chunk_size = (1,1, max(1,num_pixels_per_block/self.Nh.val), self.Nh.val, self.scanDAQ.num_ctrs)
             print('ctr_chunk_size', ctr_chunk_size)
             self.ctr_map_h5 = self.create_h5_framed_dataset('ctr_map', self.ctr_map, chunks=ctr_chunk_size, compression=None)
+            
+#             # Drift vector
+#             self.h5_m['drift_vec'] = np.zeros((self.npoints))
                         
             ##### register callbacks
-            self.scanDAQ.set_adc_n_pixel_callback(
-                num_pixels_per_block, self.every_n_callback_func_adc)
+            self.scanDAQ.set_n_pixel_callbacks(
+                num_pixels_per_block, 
+                adc_cb_func = self.every_n_callback_func_adc,
+                dac_cb_func = self.every_n_callback_func_dac
+                )
             self.scanDAQ.sync_analog_io.adc.set_done_callback(
                 self.done_callback_func_adc )
+            
+            self.dac_i = 0
             
             for ctr_i in range(self.scanDAQ.num_ctrs):
                 self.scanDAQ.set_ctr_n_pixel_callback( ctr_i,
                         num_pixels_per_block, lambda i=ctr_i: self.every_n_callback_func_ctr(i))
             
             self.pre_scan_setup()
+
+
 
             #### Start scan daq 
             self.scanDAQ.start()
@@ -208,7 +233,7 @@ class SyncRasterScan(BaseRaster2DScan):
             while not self.task_done and not self.interrupt_measurement_called:
                 self.handle_new_data()
                 time.sleep(self.display_update_period)
-                            
+                
             # FIX handle serpentine scans
             #self.display_image_map[self.scan_index_array] = self.ai_data[0,:]
             # TODO save data
@@ -220,6 +245,9 @@ class SyncRasterScan(BaseRaster2DScan):
                 self.log.info('data saved to {}'.format(self.h5_file.filename))
                 self.h5_file.close()            
             self.scanDAQ.stop()
+            self.scanDAQ.settings['connected']=False
+            # TODO disconnect callback
+            #self.scanDAQ.
             #print("Npixels", self.Npixels, 'block size', self.num_pixels_per_block, 'num_blocks', num_blocks)
             #print("pixels remaining:", self.pixels_remaining)
             #print("blocks_per_sec",1.0/ (self.scanDAQ.pixel_time*num_pixels_per_block))
@@ -255,6 +283,96 @@ class SyncRasterScan(BaseRaster2DScan):
             frame_num = (total_pixel_index // self.Npixels) - 1
             self.on_new_frame(frame_num)
         
+        return 0
+    
+    def every_n_callback_func_dac(self):
+        '''
+        DAQmx output callback notes
+            DAQmxGetWriteTotalSampPerChanGenerated
+                is actual samples generated, may be some latency with DAQmx to hardware blocks...
+            DAQmxGetWriteCurrWritePos
+                flat pointer to output buffer write position,
+                ie does not wrap with finite buffer size.
+            DAQmxGetWriteSpaceAvail
+                space between WritePos and GenPointer
+        
+        '''
+        if self.in_dac_callback:
+            print("this should not be! Re-entry into callback ")
+        print("="*80)        
+        print("dac callback! {}% frame".format( self.dac_i*100.0/self.Npixels))
+
+        
+        if self.in_dac_callback:
+            print("this should not be!")
+        
+        self.in_dac_callback = True
+        try:
+            #DAQmxGetWriteCurrWritePos(TaskHandle taskHandle, uInt64 *data);
+            write_pos1 = c_uint64()
+            #self.scanDAQ.sync_analog_io.dac.DAQmxGetWriteCurrWritePos(byref(write_pos)) 
+            
+            dac_taskhandle = self.scanDAQ.sync_analog_io.dac.task.taskHandle
+
+            mx.DAQmxGetWriteCurrWritePos(dac_taskhandle, byref(write_pos1))
+            print("DAQmxGetWriteCurrWritePos1_", write_pos1.value)
+            
+            
+            #time.sleep(0.01)
+            
+            #write_pos2 = c_uint64()
+            #mx.DAQmxGetWriteCurrWritePos(dac_taskhandle, byref(write_pos2))
+            #print("DAQmxGetWriteCurrWritePos2", write_pos2.value)
+
+
+            #mx.DAQmxSetWriteRelativeTo(dac_taskhandle, mx.DAQmx_Val_FirstSample)
+            #mx.DAQmxSetWriteOffset(dac_taskhandle, self.dac_i)
+            
+            #int32 __CFUNC DAQmxGetWriteOffset(TaskHandle taskHandle, int32 *data);
+            data = c_int32()
+            mx.DAQmxGetWriteOffset(dac_taskhandle, byref(data))
+            print("DAQmxGetWriteOffset", data.value)
+            #mx.DAQmxGetWriteRelativeTo(dac_taskhandle, byref(data) )
+            #print("DAQmxGetWriteRelativeTo", data.value)
+
+
+            x_u32 = c_uint32()
+            mx.DAQmxGetWriteSpaceAvail(dac_taskhandle, byref(x_u32))
+            print("DAQmxGetWriteSpaceAvail", x_u32.value)
+            
+            data64 = c_uint64() 
+            mx.DAQmxGetWriteTotalSampPerChanGenerated(dac_taskhandle, byref(data64))
+            print("DAQmxGetWriteTotalSampPerChanGenerated", data64)
+            
+            
+            ii = self.dac_i
+            
+            XY = self.scanDAQ.XY
+            #new_XY = XY.copy()
+            theta = (30.*ii/self.Npixels)*np.pi/180.
+            X = XY[0::2]
+            Y = XY[1::2]
+            self.new_XY[0::2] = X*np.cos(theta) - Y*np.sin(theta)
+            self.new_XY[1::2] = X*np.sin(theta) + Y*np.cos(theta)
+
+            # convert pixel index ii to data output index (2*ii)
+            self.scanDAQ.update_output_data(self.new_XY[2*ii:2*ii+2*self.num_pixels_per_block],
+                                            timeout=0.0 )
+            #time.sleep(1)
+
+            data64 = c_uint64() 
+            mx.DAQmxGetWriteTotalSampPerChanGenerated(dac_taskhandle, byref(data64))
+            print("DAQmxGetWriteTotalSampPerChanGenerated", data64)
+
+            
+            #print("write_pos delta", write_pos2.value - write_pos1.value)
+
+            self.dac_i += self.num_pixels_per_block
+            self.dac_i %= self.Npixels
+            
+
+        finally:
+            self.in_dac_callback = False
         return 0
     
     def every_n_callback_func_ctr(self, ctr_i):
