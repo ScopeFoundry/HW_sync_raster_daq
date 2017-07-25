@@ -114,9 +114,11 @@ class SyncRasterScan(BaseRaster2DScan):
         self.images = np.zeros((self.settings['Nv'],self.settings['Nh'],2))
         
             #Connect to RemCon and turn on External Scan for SEM
-        if hasattr(self,"sem_remcon"):
-            if self.sem_remcon.connected.val:
-                self.sem_remcon.remcon.write_external_scan(1)
+#         if hasattr(self,"sem_remcon"):
+#             if self.sem_remcon.connected.val:
+#                 self.sem_remcon.remcon.write_external_scan(1)
+            #FIX update check for connected
+        self.app.hardware['sem_remcon'].settings['external_scan'] = 1
         """           
                 #self.setup_scale()
                 
@@ -153,11 +155,18 @@ class SyncRasterScan(BaseRaster2DScan):
                 #callback outputs this buffer, which may be adjusted by drift correction
             self.new_XY = self.scanDAQ.XY.copy()
 
+            self.space_available = c_uint32()
+            self.write_pos = c_uint64()
+            self.samples_generated = c_uint64() 
+            self.dac_callback_elapsed = time.time()
+            self.dac_percent_frame = 0.0
 
-            x_u32 = c_uint32()
-            mx.DAQmxGetWriteSpaceAvail(dac_taskhandle, byref(x_u32))
-            self.scanDAQ.buffer_size = x_u32
-            print("Initial DAQmxGetWriteSpaceAvail", x_u32.value)
+            self.dac_taskhandle = self.scanDAQ.sync_analog_io.dac.task.taskHandle
+
+            
+            mx.DAQmxGetWriteSpaceAvail(dac_taskhandle, byref(self.space_available))
+            self.scanDAQ.buffer_size = self.space_available.value
+            print("Initial DAQmxGetWriteSpaceAvail", self.space_available.value)
 
             
             ###### compute pixel acquisition block size FIX revisit for callbacks...
@@ -299,80 +308,48 @@ class SyncRasterScan(BaseRaster2DScan):
         '''
         if self.in_dac_callback:
             print("this should not be! Re-entry into callback ")
-        print("="*80)        
-        print("dac callback! {}% frame".format( self.dac_i*100.0/self.Npixels))
-
-        
-        if self.in_dac_callback:
-            print("this should not be!")
-        
         self.in_dac_callback = True
+        self.dac_callback_elapsed = time.time()
+                
+        self.dac_percent_frame = self.dac_i*100.0/self.Npixels  
         try:
-            #DAQmxGetWriteCurrWritePos(TaskHandle taskHandle, uInt64 *data);
-            write_pos1 = c_uint64()
-            #self.scanDAQ.sync_analog_io.dac.DAQmxGetWriteCurrWritePos(byref(write_pos)) 
-            
-            dac_taskhandle = self.scanDAQ.sync_analog_io.dac.task.taskHandle
-
-            mx.DAQmxGetWriteCurrWritePos(dac_taskhandle, byref(write_pos1))
-            print("DAQmxGetWriteCurrWritePos1_", write_pos1.value)
-            
-            
-            #time.sleep(0.01)
-            
-            #write_pos2 = c_uint64()
-            #mx.DAQmxGetWriteCurrWritePos(dac_taskhandle, byref(write_pos2))
-            #print("DAQmxGetWriteCurrWritePos2", write_pos2.value)
-
-
-            #mx.DAQmxSetWriteRelativeTo(dac_taskhandle, mx.DAQmx_Val_FirstSample)
-            #mx.DAQmxSetWriteOffset(dac_taskhandle, self.dac_i)
-            
-            #int32 __CFUNC DAQmxGetWriteOffset(TaskHandle taskHandle, int32 *data);
-            data = c_int32()
-            mx.DAQmxGetWriteOffset(dac_taskhandle, byref(data))
-            print("DAQmxGetWriteOffset", data.value)
-            #mx.DAQmxGetWriteRelativeTo(dac_taskhandle, byref(data) )
+            #data = c_int32()
+            #mx.DAQmxGetWriteOffset(self.dac_taskhandle, byref(data))
+            #print("DAQmxGetWriteOffset", data.value)
+            #mx.DAQmxGetWriteRelativeTo(self.dac_taskhandle, byref(data) )
             #print("DAQmxGetWriteRelativeTo", data.value)
 
-
-            x_u32 = c_uint32()
-            mx.DAQmxGetWriteSpaceAvail(dac_taskhandle, byref(x_u32))
-            print("DAQmxGetWriteSpaceAvail", x_u32.value)
+                #sometimes these callus ? 10 ms...
+            mx.DAQmxGetWriteCurrWritePos(self.dac_taskhandle, byref(self.write_pos))
+            mx.DAQmxGetWriteSpaceAvail(self.dac_taskhandle, self.space_available)
+            mx.DAQmxGetWriteTotalSampPerChanGenerated\
+                (self.dac_taskhandle, byref(self.samples_generated))
             
-            data64 = c_uint64() 
-            mx.DAQmxGetWriteTotalSampPerChanGenerated(dac_taskhandle, byref(data64))
-            print("DAQmxGetWriteTotalSampPerChanGenerated", data64)
-            
-            
-            ii = self.dac_i
-            
-            XY = self.scanDAQ.XY
+#            XY = self.scanDAQ.XY
             #new_XY = XY.copy()
-            theta = (30.*ii/self.Npixels)*np.pi/180.
-            X = XY[0::2]
-            Y = XY[1::2]
-            self.new_XY[0::2] = X*np.cos(theta) - Y*np.sin(theta)
-            self.new_XY[1::2] = X*np.sin(theta) + Y*np.cos(theta)
+#             theta = (30.*ii/self.Npixels)*np.pi/180.
+#             X = XY[0::2]
+#             Y = XY[1::2]
+#             self.new_XY[0::2] = X*np.cos(theta) - Y*np.sin(theta)
+#             self.new_XY[1::2] = X*np.sin(theta) + Y*np.cos(theta)
 
-            # convert pixel index ii to data output index (2*ii)
-            self.scanDAQ.update_output_data(self.new_XY[2*ii:2*ii+2*self.num_pixels_per_block],
-                                            timeout=0.0 )
-            #time.sleep(1)
-
-            data64 = c_uint64() 
-            mx.DAQmxGetWriteTotalSampPerChanGenerated(dac_taskhandle, byref(data64))
-            print("DAQmxGetWriteTotalSampPerChanGenerated", data64)
-
-            
-            #print("write_pos delta", write_pos2.value - write_pos1.value)
-
+                # update DAC output array 
+                # convert pixel index ii to data output index (2*ii)
+            ii = self.dac_i
+            self.scanDAQ.update_output_data\
+                (self.new_XY[2*ii:2*ii+2*self.num_pixels_per_block],timeout=0.0 )
             self.dac_i += self.num_pixels_per_block
-            self.dac_i %= self.Npixels
-            
+            self.dac_i %= self.Npixels            
 
         finally:
             self.in_dac_callback = False
+            self.dac_callback_elapsed = time.time() - self.dac_callback_elapsed
+            print("DAQ elapsed time {:.3g} ms {}% frame write pos {:d} space {:d} samples {:d}"\
+                  .format(self.dac_callback_elapsed*1e3, self.dac_percent_frame,\
+                          self.write_pos.value,\
+                          self.space_available.value,\
+                          self.samples_generated.value))
+
         return 0
     
     def every_n_callback_func_ctr(self, ctr_i):
@@ -454,42 +431,47 @@ class SyncRasterScan(BaseRaster2DScan):
         if self.settings['correct_drift']:
             frame_num = (self.total_pixel_index // self.Npixels) - 1
             print('frame_num',frame_num)
-            if frame_num == 0:
-                #Reference image
-                self.images[:,:,0] = self.adc_map[0,:,:,self.correct_chan]
-            else:
-                #Offset image
-                self.images[:,:,1] = self.adc_map[0,:,:,self.correct_chan] #assumes no subframes
+#             if frame_num == 0:
+#                 #Reference image
+#                 self.images[:,:,0] = self.adc_map[0,:,:,self.correct_chan]
+#             else:
+#                 #Offset image
+#                 self.images[:,:,1] = self.adc_map[0,:,:,self.correct_chan] #assumes no subframes
             
             if frame_num > 0:
-                # Shift determination
-                shift, error, diffphase = self.register_translation_hybrid(self.images[:,:,0]*self.win, self.images[:,:,1]*self.win, 
-                                                                           exponent = self.settings['correlation_exp'], upsample_factor = 100)
-                print('Image shift [px]', shift)
-                # Shift defined as [y, x] vector in direction of motion of view relative to sample
-                # pos x shifts view to the right
-                # pos y shifts view upwards
                 
-                # Calculate beam shift [x, y]
-                # pos x shifts view to the left
-                # pos y shifts view upwards
-                full_size = self.app.hardware['sem_remcon'].settings['full_size'] * 10**6
-                scan_size_h = ((self.settings['h1']-self.settings['h0'])/20.0) * full_size
-                scan_size_v = ((self.settings['v1']-self.settings['v0'])/20.0) * full_size
-                print('Scan size [um]',(scan_size_h, scan_size_v))
-                # x beam shift
-                self.beam_shift[0] = self.settings['proportional_gain'] * shift[1] * self.shift_factor_h * (scan_size_h/self.settings['Nh'])
-                # y beam shift
-                self.beam_shift[1] = -1 * self.settings['proportional_gain'] * shift[0] * self.shift_factor_v * (scan_size_v/self.settings['Nv'])
-                print('Beam Shift [%]', self.beam_shift)
-                self.app.hardware['sem_remcon'].settings['beamshift_xy'] = self.beam_shift
-                
-                # Wait for beam shift to adjust (didn't seem to actually pause scanning)
-                # time.sleep(2)
-                
-                # other option
-                # self.app.hardware['sem_remcon'].settings.beamshift_xy.update_value(self.beam_shift)
-                # print('Hardware Shift? [%]', self.app.hardware['sem_remcon'].settings['beamshift_xy'])
+                if True:
+                    #self.new_XY += 0.2                   
+                    self.new_XY *= 0.95
+                else:
+                    # Shift determination
+                    shift, error, diffphase = self.register_translation_hybrid(self.images[:,:,0]*self.win, self.images[:,:,1]*self.win, 
+                                                                               exponent = self.settings['correlation_exp'], upsample_factor = 100)
+                    print('Image shift [px]', shift)
+                    # Shift defined as [y, x] vector in direction of motion of view relative to sample
+                    # pos x shifts view to the right
+                    # pos y shifts view upwards
+                    
+                    # Calculate beam shift [x, y]
+                    # pos x shifts view to the left
+                    # pos y shifts view upwards
+                    full_size = self.app.hardware['sem_remcon'].settings['full_size'] * 10**6
+                    scan_size_h = ((self.settings['h1']-self.settings['h0'])/20.0) * full_size
+                    scan_size_v = ((self.settings['v1']-self.settings['v0'])/20.0) * full_size
+                    print('Scan size [um]',(scan_size_h, scan_size_v))
+                    # x beam shift
+                    self.beam_shift[0] = self.settings['proportional_gain'] * shift[1] * self.shift_factor_h * (scan_size_h/self.settings['Nh'])
+                    # y beam shift
+                    self.beam_shift[1] = -1 * self.settings['proportional_gain'] * shift[0] * self.shift_factor_v * (scan_size_v/self.settings['Nv'])
+                    print('Beam Shift [%]', self.beam_shift)
+                    self.app.hardware['sem_remcon'].settings['beamshift_xy'] = self.beam_shift
+                    
+                    # Wait for beam shift to adjust (didn't seem to actually pause scanning)
+                    # time.sleep(2)
+                    
+                    # other option
+                    # self.app.hardware['sem_remcon'].settings.beamshift_xy.update_value(self.beam_shift)
+                    # print('Hardware Shift? [%]', self.app.hardware['sem_remcon'].settings['beamshift_xy'])
 
     def on_new_ctr_data(self, ctr_i, new_data):
         #print("on_new_ctr_data {} {}".format(ctr_i, new_data))
