@@ -241,17 +241,22 @@ class SyncRasterDAQ(HardwareComponent):
         self.sync_analog_io.stop()
         
         
-    def set_n_pixel_callbacks(self, n_pixels, adc_cb_func=None, dac_cb_func=None):
+    def set_n_pixel_callback_adc(self, n_pixels, adc_cb_func):
         """
         Setup callback functions for EveryNSamplesEvent
         *cb_func* will be called 
         after every *n_pixels* are acquired. 
         """
-        if adc_cb_func:
-            n_samples = n_pixels*self.settings['adc_oversample']
-            self.sync_analog_io.adc.set_n_sample_callback(n_samples, adc_cb_func)
-        if dac_cb_func:
-            self.sync_analog_io.dac.set_n_sample_callback(n_pixels, dac_cb_func)
+        n_samples = n_pixels*self.settings['adc_oversample']
+        self.sync_analog_io.adc.set_n_sample_callback(n_samples, adc_cb_func)
+
+    def set_n_pixel_callback_dac(self, n_pixels, dac_cb_func):
+        """
+        Setup callback functions for EveryNSamplesEvent
+        *cb_func* will be called 
+        after every *n_pixels* are acquired. 
+        """
+        self.sync_analog_io.dac.set_n_sample_callback(n_pixels, dac_cb_func)
         
         
     

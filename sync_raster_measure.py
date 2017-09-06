@@ -11,9 +11,10 @@ from ScopeFoundry import h5_io
 import numpy as np
 import time
 from ScopeFoundry.helper_funcs import load_qt_ui_file, sibling_path
-from skimage.feature.register_translation import _upsampled_dft, _compute_error, _compute_phasediff
 from ctypes import c_int32, c_uint32, c_uint64, byref
 import PyDAQmx as mx
+from .drift_correction import register_translation_hybrid
+from ScopeFoundry.logged_quantity import LoggedQuantity, LQCollection
 
 class SyncRasterScan(BaseRaster2DScan):
 
@@ -35,10 +36,13 @@ class SyncRasterScan(BaseRaster2DScan):
                             unit='x')
         self.disp_chan_choices = ['adc0', 'adc1', 'ctr0', 'ctr1'] 
         self.settings.New("display_chan", dtype=str, initial='adc0', choices=tuple(self.disp_chan_choices))
-        self.settings.New("correct_drift", dtype=bool, initial=False)        
+        self.settings.New("correct_drift", dtype=bool, initial=False)
+        self.settings.New("correct_chan", dtype=int, initial=1, vmin=0, vmax=1)        
         self.settings.New("correlation_exp", dtype=float, initial=0.3, vmin=0., vmax=1.)
         self.settings.New("proportional_gain", dtype=float, initial=0.3, vmin=0.)
-        self.settings.New('current_drift', dtype=float,array=True, ro=True, si=True, unit='px')
+        # For now, these are just indicators
+        self.settings.New('dac_offset_x', dtype=float, ro=True, unit='V', vmin = -10., vmax = 10.)
+        self.settings.New('dac_offset_y', dtype=float, ro=True, unit='V', vmin = -10., vmax = 10.)
         
         self.scanDAQ = self.app.hardware['sync_raster_daq']        
         self.scan_on=False
@@ -59,9 +63,6 @@ class SyncRasterScan(BaseRaster2DScan):
         if hasattr(self.app,'sem_remcon'):#FIX re-implement later
             self.sem_remcon=self.app.sem_remcon
         
-        # Initialize quantities for real-time drift correction
-        
-        
         
 #     def dock_config(self):
 #         
@@ -79,55 +80,36 @@ class SyncRasterScan(BaseRaster2DScan):
     
     def run(self):
         
-        self.in_dac_callback = False #make sure callback completes in time
+        self.on_start_of_run()
+        
+        self.adc_poll_period = 0.050
         
         # if hardware is not connected, connect it
         time.sleep(0.5)
         if not self.scanDAQ.settings['connected']:
             self.scanDAQ.settings['connected'] = True
-            #self.app.qtapp.processEvents()
             # we need to wait while the task is created before 
             # measurement thread continues
             time.sleep(0.2)
             
         self.scanDAQ.settings['adc_oversample'] = self.settings['adc_oversample']
         
-        # READ FROM HARDWARE BEFORE SCANNING -- Drift correction depends on accurate numbers
+            # READ FROM HARDWARE BEFORE SCANNING -- Drift correction depends on accurate numbers
+            # also disable beam blank, enable ext scan
         self.app.hardware['sem_remcon'].read_from_hardware()
-
-        # Compute data arrays        
-        #self.log.debug( "computing scan arrays")
-        self.compute_scan_arrays()
-        #self.log.debug( "computing scan arrays... done")
-        
+        self.app.hardware['sem_remcon'].settings['external_scan'] = 1
+        self.app.hardware['sem_remcon'].settings['beam_blanking'] = 0
+       
+            # Compute data arrays (scanDAQ.XY)        
+        self.compute_scan_arrays()        
         self.initial_scan_setup_plotting = True        
         self.display_image_map = np.zeros(self.scan_shape, dtype=float)
     
             # Initialize quantities for drift correction
         self.win = np.outer(np.hanning(self.settings['Nv']),np.hanning(self.settings['Nh']))
-        self.correct_chan = 1 # NOTE: This should be an lq in case one detector or the other doesn't work
-        self.drift = [0, 0] # Defined as [y, x] vector
-            #WIP will soon update scan position with DAC xy array..
-        self.shift_factor_h = 5.495 # beam shift % / um: Calibrated at WD = 10.1 mm
-        self.shift_factor_v = 4.831 # beam shift % / um: Calibrated at WD = 10.1 mm
-        self.beam_shift = list(self.app.hardware['sem_remcon'].settings['beamshift_xy'])
-        self.images = np.zeros((self.settings['Nv'],self.settings['Nh'],2))
+                                
+        self.in_dac_callback = False #flag to prevent reentrant execution
         
-            #Connect to RemCon and turn on External Scan for SEM
-#         if hasattr(self,"sem_remcon"):
-#             if self.sem_remcon.connected.val:
-#                 self.sem_remcon.remcon.write_external_scan(1)
-            #FIX update check for connected
-        self.app.hardware['sem_remcon'].settings['external_scan'] = 1
-        """           
-                #self.setup_scale()
-                
-                if self.scanner.auto_blanking.val:
-                    if hasattr(self,"sem_remcon"):
-                        if self.sem_remcon.connected.val:
-                            self.sem_remcon.remcon.write_beam_blanking(0)
-        """                    
-                        
         try:
             if self.settings['save_h5']:
                 self.h5_file = h5_io.h5_base_file(self.app, measurement=self)
@@ -136,68 +118,72 @@ class SyncRasterScan(BaseRaster2DScan):
             else:
                 self.display_update_period = 0.01
 
-            ##### Start indexing            
-            #self.frame_num = 0
+                ##### Start indexing            
             self.total_pixel_index = 0 # contains index of next adc pixel to be moved from queue into h5 file
-            self.pixel_index = 0 # contains index of next adc pixel to be moved from queue into adc_pixels (within frame)
+            self.pixel_index = 0 # contains index of next adc pixel to be moved from queue into adc_pixels (within frame display)
             self.current_scan_index = self.scan_index_array[0]
             self.task_done = False
-            
-            
-            ##### load XY positions in to DAC
-            dac_taskhandle = self.scanDAQ.sync_analog_io.dac.task.taskHandle
+                       
+                ##### load initial XY positions in to DAC
+            self.dac_taskhandle = self.scanDAQ.sync_analog_io.dac.task.taskHandle
                 #allow regen lets DAQ loop over scan buffer, do before task starts
                 #callbacks optionally dynamically update buffer for drift
-            mx.DAQmxSetWriteRegenMode(dac_taskhandle, mx.DAQmx_Val_AllowRegen)
+            mx.DAQmxSetWriteRegenMode(self.dac_taskhandle, mx.DAQmx_Val_AllowRegen)
 
                 #FIX kludge so python image matches SEM image
             self.scanDAQ.setup_io_with_data(self.scan_h_positions, -1*self.scan_v_positions)
-                #callback outputs this buffer, which may be adjusted by drift correction
-            self.new_XY = self.scanDAQ.XY.copy()
+            
+            self.orig_XY = self.scanDAQ.XY.copy() # copy of the original raster            
+            self.current_frame_XY = self.orig_XY.copy()
+            
+            #callback outputs this buffer, which may be adjusted by drift correction
+            self.next_frame_XY = self.orig_XY.copy()
+            self.next_frame_XY_ready = False
 
+            
+
+            #c-type variables used by DAQmx status functions
             self.space_available = c_uint32()
             self.write_pos = c_uint64()
             self.samples_generated = c_uint64() 
             self.dac_callback_elapsed = time.time()
-            self.dac_percent_frame = 0.0
-
-            self.dac_taskhandle = self.scanDAQ.sync_analog_io.dac.task.taskHandle
-
             
-            mx.DAQmxGetWriteSpaceAvail(dac_taskhandle, byref(self.space_available))
+            mx.DAQmxGetWriteSpaceAvail(self.dac_taskhandle, byref(self.space_available))
             self.scanDAQ.buffer_size = self.space_available.value
-            print("Initial DAQmxGetWriteSpaceAvail", self.space_available.value)
+            self.log.info("Initial DAQmxGetWriteSpaceAvail {}".format( self.space_available.value))
+            
 
-            
-            ###### compute pixel acquisition block size FIX revisit for callbacks...
-            # need at least one, and needs to be an integer divisor of Npixels
-            
-            #num_pixels_per_block = max(1, int(np.ceil(25*self.display_update_period / self.scanDAQ.pixel_time)))
-            num_pixels_per_block = int(self.Npixels/4)
+            ###### compute pixel acquisition block size 
+            # need at least one, and needs to an integer divisor of Npixels            
+                #ADC input callback block size
+            num_pixels_per_block = max(1, int(np.ceil(self.adc_poll_period / self.scanDAQ.pixel_time)))
                 #force block to be an integer number of horizontal scan lines
             if num_pixels_per_block > self.Nh.val:
-                num_pixels_per_block = self.Nh.val*np.ceil( num_pixels_per_block / self.Nh.val )
-                
+                num_pixels_per_block = self.Nh.val*np.ceil( num_pixels_per_block / self.Nh.val )                
             num_blocks = int(max(1, np.floor(self.Npixels / num_pixels_per_block)))
             
+            
+            #force/calc integer number of adc blocks per image
             while self.Npixels % num_blocks != 0:
                 num_blocks -= 1
-                #print("num_blocks", num_blocks)
             self.num_pixels_per_block = num_pixels_per_block = int(self.Npixels / num_blocks)
             self.log.info("num_pixels_per_block {}".format( num_pixels_per_block))
-        
-            self.time_per_block = num_pixels_per_block * self.scanDAQ.pixel_time            
+
+                # minimum DAC callback half an image since initial buffer is one image
+            self.num_pixels_per_dac_block = int(self.Npixels/2)
+            self.time_per_dac_block = self.num_pixels_per_dac_block * self.scanDAQ.pixel_time            
+            assert self.num_pixels_per_dac_block*2 == self.Npixels #Npixels needs to be even...            
+            self.log.info("num_pixels_per_dac_block {}".format( self.num_pixels_per_dac_block))        
+            
             
             ##### Data array
             # ADC
             self.adc_pixels = np.zeros((self.Npixels, self.scanDAQ.adc_chan_count), dtype=float)
-            #self.adc_pixels_oversample = np.zeros((self.Npixels, self.scanDAQ.adc_chan_count*self.scanDAQ.settings['adc_oversample']))
-            #self.pixels_remaining = self.Npixels # in frame
             self.new_adc_data_queue = [] # will contain numpy arrays (data blocks) from adc to be processed
             self.adc_map = np.zeros(self.scan_shape + (self.scanDAQ.adc_chan_count,), dtype=float)
             
             adc_chunk_size = (1,1, max(1,num_pixels_per_block/self.Nh.val), self.Nh.val ,self.scanDAQ.adc_chan_count )
-            print('adc_chunk_size', adc_chunk_size)
+            self.log.info('adc_chunk_size {}'.format(adc_chunk_size))
             self.adc_map_h5 = self.create_h5_framed_dataset('adc_map', self.adc_map, chunks=adc_chunk_size, compression=None)
                     
             # Ctr
@@ -210,18 +196,27 @@ class SyncRasterScan(BaseRaster2DScan):
             self.ctr_map = np.zeros(self.scan_shape + (self.scanDAQ.num_ctrs,), dtype=int)
             self.ctr_map_Hz = np.zeros(self.ctr_map.shape, dtype=float)
             ctr_chunk_size = (1,1, max(1,num_pixels_per_block/self.Nh.val), self.Nh.val, self.scanDAQ.num_ctrs)
-            print('ctr_chunk_size', ctr_chunk_size)
+            self.log.info('ctr_chunk_size {}'.format(ctr_chunk_size))
             self.ctr_map_h5 = self.create_h5_framed_dataset('ctr_map', self.ctr_map, chunks=ctr_chunk_size, compression=None)
             
-#             # Drift vector
+            # Drift vector stored to h5
+            self.dac_offsets = [np.zeros(2, dtype=float)] # list of pairs of (dx,dy) in volts
+            self.dac_offset_h5 = self.create_h5_framed_dataset('dac_offset', self.dac_offsets[0])
+            
+            
 #             self.h5_m['drift_vec'] = np.zeros((self.npoints))
+
+            
                         
             ##### register callbacks
-            self.scanDAQ.set_n_pixel_callbacks(
+            self.scanDAQ.set_n_pixel_callback_adc(
                 num_pixels_per_block, 
-                adc_cb_func = self.every_n_callback_func_adc,
-                dac_cb_func = self.every_n_callback_func_dac
-                )
+                self.every_n_callback_func_adc)
+            
+            self.scanDAQ.set_n_pixel_callback_dac(
+                self.num_pixels_per_dac_block,
+                self.every_n_callback_func_dac)
+            
             self.scanDAQ.sync_analog_io.adc.set_done_callback(
                 self.done_callback_func_adc )
             
@@ -231,9 +226,8 @@ class SyncRasterScan(BaseRaster2DScan):
                 self.scanDAQ.set_ctr_n_pixel_callback( ctr_i,
                         num_pixels_per_block, lambda i=ctr_i: self.every_n_callback_func_ctr(i))
             
+            
             self.pre_scan_setup()
-
-
 
             #### Start scan daq 
             self.scanDAQ.start()
@@ -241,7 +235,7 @@ class SyncRasterScan(BaseRaster2DScan):
             #### Wait until done, while processing data queues
             while not self.task_done and not self.interrupt_measurement_called:
                 self.handle_new_data()
-                time.sleep(self.display_update_period)
+                time.sleep(self.adc_poll_period)
                 
             # FIX handle serpentine scans
             #self.display_image_map[self.scan_index_array] = self.ai_data[0,:]
@@ -261,7 +255,15 @@ class SyncRasterScan(BaseRaster2DScan):
             #print("pixels remaining:", self.pixels_remaining)
             #print("blocks_per_sec",1.0/ (self.scanDAQ.pixel_time*num_pixels_per_block))
             #print("frames_per_sec",1.0/ (self.scanDAQ.pixel_time*self.Npixels))
-
+            
+            # Update the H, V raster values to the dac offsets so scan window displacement is visible
+            # Also allows next scan to start in the same location
+            if self.settings['correct_drift']:
+                self.settings['h0'] += self.dac_offsets[-1][0]
+                self.settings['h1'] += self.dac_offsets[-1][0]
+                self.settings['v0'] -= self.dac_offsets[-1][1]
+                self.settings['v1'] -= self.dac_offsets[-1][1]
+            
             self.post_scan_cleanup()
 
         
@@ -319,26 +321,24 @@ class SyncRasterScan(BaseRaster2DScan):
             #mx.DAQmxGetWriteRelativeTo(self.dac_taskhandle, byref(data) )
             #print("DAQmxGetWriteRelativeTo", data.value)
 
-                #sometimes these callus ? 10 ms...
+            #sometimes these callus ? 10 ms...
             mx.DAQmxGetWriteCurrWritePos(self.dac_taskhandle, byref(self.write_pos))
             mx.DAQmxGetWriteSpaceAvail(self.dac_taskhandle, self.space_available)
-            mx.DAQmxGetWriteTotalSampPerChanGenerated\
-                (self.dac_taskhandle, byref(self.samples_generated))
+            mx.DAQmxGetWriteTotalSampPerChanGenerated(
+                self.dac_taskhandle, byref(self.samples_generated))
             
-#            XY = self.scanDAQ.XY
-            #new_XY = XY.copy()
-#             theta = (30.*ii/self.Npixels)*np.pi/180.
-#             X = XY[0::2]
-#             Y = XY[1::2]
-#             self.new_XY[0::2] = X*np.cos(theta) - Y*np.sin(theta)
-#             self.new_XY[1::2] = X*np.sin(theta) + Y*np.cos(theta)
-
-                # update DAC output array 
-                # convert pixel index ii to data output index (2*ii)
+            # update DAC output array 
             ii = self.dac_i
-            self.scanDAQ.update_output_data\
-                (self.new_XY[2*ii:2*ii+2*self.num_pixels_per_block],timeout=0.0 )
-            self.dac_i += self.num_pixels_per_block
+            
+            if self.next_frame_XY_ready and self.dac_i == 0:
+                self.current_frame_XY = self.next_frame_XY.copy()
+                self.next_frame_XY_ready = False
+            
+            # note: convert pixel index ii to data output index (2*ii) for two channels (x,y)
+            self.scanDAQ.update_output_data(
+                self.current_frame_XY[2*ii:2*ii+2*self.num_pixels_per_dac_block],
+                timeout=0.0 )
+            self.dac_i += self.num_pixels_per_dac_block
             self.dac_i %= self.Npixels            
 
         finally:
@@ -416,7 +416,7 @@ class SyncRasterScan(BaseRaster2DScan):
                 self.adc_map_h5[frame_num, :,:,:,:] = self.adc_map
                 self.h5_file.flush()
             
-            self.on_end_frame(frame_num - 1)
+            self.on_end_frame(frame_num) # removed -1 !!!!
             
             # Stop scan if n_frames reached:
             if (not self.settings['continuous_scan']) \
@@ -428,51 +428,62 @@ class SyncRasterScan(BaseRaster2DScan):
         pass
     
     def on_end_frame(self, frame_i):
+        
         if self.settings['correct_drift']:
-            frame_num = (self.total_pixel_index // self.Npixels) - 1
+            frame_num = frame_i
             print('frame_num',frame_num)
-#             if frame_num == 0:
-#                 #Reference image
-#                 self.images[:,:,0] = self.adc_map[0,:,:,self.correct_chan]
-#             else:
-#                 #Offset image
-#                 self.images[:,:,1] = self.adc_map[0,:,:,self.correct_chan] #assumes no subframes
             
-            if frame_num > 0:
+            if frame_num == 0:
+                #Reference image
+                self.ref_image = self.adc_map[0,:,:,self.settings['correct_chan']].copy()
+                print('reference image stored')
+                self.cumul_shift = [(0., 0.)] # Initialize cumulative shifts incurred over this scan
+                print('Cumulative shift (x,y)', self.cumul_shift[-1])
+            else:
+                #Offset image
+                self.offset_image = self.adc_map[0,:,:,self.settings['correct_chan']] #assumes no subframes
+                print('map shape', self.adc_map.shape)
+                print('current image stored')
+                            
+                # Shift determination
+                shift, error, diffphase = register_translation_hybrid(self.ref_image*self.win, self.offset_image*self.win, 
+                                                                           exponent = self.settings['correlation_exp'], upsample_factor = 100)
+                print('Image shift [px]', shift)
+                # Shift defined as [y, x] vector in direction of motion of view relative to sample
+                # pos x shifts view to the right
+                # pos y shifts view upwards
                 
-                if True:
-                    #self.new_XY += 0.2                   
-                    self.new_XY *= 0.95
-                else:
-                    # Shift determination
-                    shift, error, diffphase = self.register_translation_hybrid(self.images[:,:,0]*self.win, self.images[:,:,1]*self.win, 
-                                                                               exponent = self.settings['correlation_exp'], upsample_factor = 100)
-                    print('Image shift [px]', shift)
-                    # Shift defined as [y, x] vector in direction of motion of view relative to sample
-                    # pos x shifts view to the right
-                    # pos y shifts view upwards
-                    
-                    # Calculate beam shift [x, y]
-                    # pos x shifts view to the left
-                    # pos y shifts view upwards
-                    full_size = self.app.hardware['sem_remcon'].settings['full_size'] * 10**6
-                    scan_size_h = ((self.settings['h1']-self.settings['h0'])/20.0) * full_size
-                    scan_size_v = ((self.settings['v1']-self.settings['v0'])/20.0) * full_size
-                    print('Scan size [um]',(scan_size_h, scan_size_v))
-                    # x beam shift
-                    self.beam_shift[0] = self.settings['proportional_gain'] * shift[1] * self.shift_factor_h * (scan_size_h/self.settings['Nh'])
-                    # y beam shift
-                    self.beam_shift[1] = -1 * self.settings['proportional_gain'] * shift[0] * self.shift_factor_v * (scan_size_v/self.settings['Nv'])
-                    print('Beam Shift [%]', self.beam_shift)
-                    self.app.hardware['sem_remcon'].settings['beamshift_xy'] = self.beam_shift
-                    
-                    # Wait for beam shift to adjust (didn't seem to actually pause scanning)
-                    # time.sleep(2)
-                    
-                    # other option
-                    # self.app.hardware['sem_remcon'].settings.beamshift_xy.update_value(self.beam_shift)
-                    # print('Hardware Shift? [%]', self.app.hardware['sem_remcon'].settings['beamshift_xy'])
+                # shift_factor converts pixel shift to voltage shift
+                shift_factor_h = -1*(self.settings['h1']-self.settings['h0'])/self.settings['Nh'] # V/px
+                shift_factor_v = (self.settings['v1']-self.settings['v0'])/self.settings['Nv'] # V/px
+                
+                # Proportional gain reduces correction in anticipation of overcorrection due to not applying
+                # correction until an image later than prescribed
+                P = self.settings['proportional_gain']
+                # cumul_shift keeps track of cumulative 'measured' shifts
+                self.cumul_shift += [(self.cumul_shift[-1][0] + shift_factor_h * shift[1], 
+                                      self.cumul_shift[-1][1] + shift_factor_v * shift[0])]   # Volts
+                print('Cumulative shift (x,y)', self.cumul_shift[-1])
+                
 
+                self.dac_offsets += [P * np.array(self.cumul_shift[-1])]
+                print('DAC offset (x,y)', self.dac_offsets[-1])
+                self.settings['dac_offset_x'] = self.dac_offsets[-1][0]
+                self.settings['dac_offset_y'] = self.dac_offsets[-1][1]
+                
+                self.next_frame_XY[0::2] = self.orig_XY[0::2] + self.dac_offsets[-1][0]  # shift x raster
+                self.next_frame_XY[1::2] = self.orig_XY[1::2] + self.dac_offsets[-1][1]  # shift y raster
+                
+                self.next_frame_XY_ready = True
+                
+                if self.settings['save_h5']:
+                    self.extend_h5_framed_dataset(self.dac_offset_h5, frame_num)
+                    # dac offset keeps track of 'applied' offsets, which is P * shifts
+                    
+#                     self.settings['dac_offset'] = self.dac_offset[-1]
+                    self.dac_offset_h5[frame_i,:] = self.dac_offsets[-1]
+                    self.h5_file.flush()
+                
     def on_new_ctr_data(self, ctr_i, new_data):
         #print("on_new_ctr_data {} {}".format(ctr_i, new_data))
         ii = self.ctr_pixel_index[ctr_i]
@@ -501,6 +512,9 @@ class SyncRasterScan(BaseRaster2DScan):
                 self.h5_file.flush()
         
 
+    def on_start_of_run(self):
+        pass
+    
     def pre_scan_setup(self):
         pass
 
@@ -512,12 +526,12 @@ class SyncRasterScan(BaseRaster2DScan):
         #self.display_pixels = self.adc_pixels[:,DISPLAY_CHAN]
         #self.display_pixels[0] = 0
         
-        chan_data = dict(
-            adc0 = self.adc_pixels[:,0],
-            adc1 = self.adc_pixels[:,1],
-            ctr0 = self.ctr_pixels[:,0],
-            ctr1 = self.ctr_pixels[:,1],
-            )
+        chan_data = {
+            'adc0': self.adc_pixels[:,0],
+            'adc1': self.adc_pixels[:,1],
+            'ctr0': self.ctr_pixels[:,0],
+            'ctr1': self.ctr_pixels[:,1],
+            }
         
         self.display_pixels = chan_data[self.settings['display_chan']]
         
@@ -580,138 +594,3 @@ class SyncRasterScan(BaseRaster2DScan):
             self.settings['pixel_time'] = 1.0/self.scanDAQ.settings['dac_rate']
         BaseRaster2DScan.compute_times(self)
 
-    def register_translation_hybrid(self, src_image, target_image, exponent = 1, upsample_factor=1,
-                         space="real"):
-        """
-        Efficient subpixel image translation registration by hybrid-correlation (cross and phase).
-        Exponent = 1 -> cross correlation, exponent = 0 -> phase correlation.
-        Closer to zero is more precise but more susceptible to noise.
-        
-        This code gives the same precision as the FFT upsampled correlation
-        in a fraction of the computation time and with reduced memory requirements.
-        It obtains an initial estimate of the cross-correlation peak by an FFT and
-        then refines the shift estimation by upsampling the DFT only in a small
-        neighborhood of that estimate by means of a matrix-multiply DFT.
-    
-        Parameters
-        ----------
-        src_image : ndarray
-            Reference image.
-        target_image : ndarray
-            Image to register.  Must be same dimensionality as ``src_image``.
-        exponent: float, optional
-            Power to which amplitude contribution to correlation is raised.
-            exponent = 0: Phase correlation
-            exponent = 1: Cross correlation
-            0 < exponent < 1 = Hybrid
-        upsample_factor : int, optional
-            Upsampling factor. Images will be registered to within
-            ``1 / upsample_factor`` of a pixel. For example
-            ``upsample_factor == 20`` means the images will be registered
-            within 1/20th of a pixel.  Default is 1 (no upsampling)
-        space : string, one of "real" or "fourier"
-            Defines how the algorithm interprets input data.  "real" means data
-            will be FFT'd to compute the correlation, while "fourier" data will
-            bypass FFT of input data.  Case insensitive.
-    
-        Returns
-        -------
-        shifts : ndarray
-            Shift vector (in pixels) required to register ``target_image`` with
-            ``src_image``.  Axis ordering is consistent with numpy (e.g. Z, Y, X)
-        error : float
-            Translation invariant normalized RMS error between ``src_image`` and
-            ``target_image``.
-        phasediff : float
-            Global phase difference between the two images (should be
-            zero if images are non-negative).
-    
-        References
-        ----------
-        .. [1] Manuel Guizar-Sicairos, Samuel T. Thurman, and James R. Fienup,
-               "Efficient subpixel image registration algorithms,"
-               Optics Letters 33, 156-158 (2008).
-        """
-        # images must be the same shape
-        if src_image.shape != target_image.shape:
-            raise ValueError("Error: images must be same size for "
-                             "register_translation")
-    
-        # only 2D data makes sense right now
-        if src_image.ndim != 2 and upsample_factor > 1:
-            raise NotImplementedError("Error: register_translation only supports "
-                                      "subpixel registration for 2D images")
-    
-        # assume complex data is already in Fourier space
-        if space.lower() == 'fourier':
-            src_freq = src_image
-            target_freq = target_image
-        # real data needs to be fft'd.
-        elif space.lower() == 'real':
-            src_image = np.array(src_image, dtype=np.complex128, copy=False)
-            target_image = np.array(target_image, dtype=np.complex128, copy=False)
-            src_freq = np.fft.fftn(src_image)
-            target_freq = np.fft.fftn(target_image)
-        else:
-            raise ValueError("Error: register_translation only knows the \"real\" "
-                             "and \"fourier\" values for the ``space`` argument.")
-    
-        # Whole-pixel shift - Compute hybrid-correlation by an IFFT
-        shape = src_freq.shape
-        image_product = src_freq * target_freq.conj()
-        amplitude = np.abs(image_product)
-        phase = np.angle(image_product)
-        total_fourier = amplitude**exponent * np.exp(phase * 1j)
-        correlation = np.fft.ifftn(total_fourier)
-    
-        # Locate maximum
-        maxima = np.unravel_index(np.argmax(np.abs(correlation)),
-                                  correlation.shape)
-        midpoints = np.array([np.fix(axis_size / 2) for axis_size in shape])
-    
-        shifts = np.array(maxima, dtype=np.float64)
-        shifts[shifts > midpoints] -= np.array(shape)[shifts > midpoints]
-    
-        if upsample_factor == 1:
-            src_amp = np.sum(np.abs(src_freq) ** 2) / src_freq.size
-            target_amp = np.sum(np.abs(target_freq) ** 2) / target_freq.size
-            CCmax = correlation.max()
-        # If upsampling > 1, then refine estimate with matrix multiply DFT
-        else:
-            # Initial shift estimate in upsampled grid
-            shifts = np.round(shifts * upsample_factor) / upsample_factor
-            upsampled_region_size = np.ceil(upsample_factor * 1.5)
-            # Center of output array at dftshift + 1
-            dftshift = np.fix(upsampled_region_size / 2.0)
-            upsample_factor = np.array(upsample_factor, dtype=np.float64)
-            normalization = (src_freq.size * upsample_factor ** 2)
-            # Matrix multiply DFT around the current shift estimate
-            sample_region_offset = dftshift - shifts*upsample_factor
-            correlation = _upsampled_dft(total_fourier.conj(),
-                                               upsampled_region_size,
-                                               upsample_factor,
-                                               sample_region_offset).conj()
-            correlation /= normalization
-            # Locate maximum and map back to original pixel grid
-            maxima = np.array(np.unravel_index(
-                                  np.argmax(np.abs(correlation)),
-                                  correlation.shape),
-                              dtype=np.float64)
-            maxima -= dftshift
-            shifts = shifts + maxima / upsample_factor
-            CCmax = correlation.max()
-            src_amp = _upsampled_dft(src_freq * src_freq.conj(),
-                                     1, upsample_factor)[0, 0]
-            src_amp /= normalization
-            target_amp = _upsampled_dft(target_freq * target_freq.conj(),
-                                        1, upsample_factor)[0, 0]
-            target_amp /= normalization
-    
-        # If its only one row or column the shift along that dimension has no
-        # effect. We set to zero.
-        for dim in range(src_freq.ndim):
-            if shape[dim] == 1:
-                shifts[dim] = 0
-    
-        return shifts, _compute_error(CCmax, src_amp, target_amp),\
-            _compute_phasediff(CCmax)
