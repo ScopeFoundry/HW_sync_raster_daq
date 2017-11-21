@@ -6,6 +6,7 @@ Rewritten 2016-07-11 ESB
 Rewritten 2017-01-27 ESB
 
 '''
+from qtpy import QtCore
 from ScopeFoundry import HardwareComponent
 from ScopeFoundry.helper_funcs import str2bool
 
@@ -19,6 +20,10 @@ import numpy as np
 class SyncRasterDAQ(HardwareComponent):
     
     name = 'sync_raster_daq'
+    
+    # signal emitted when channels changed (adc, dac, ctr, enabled/disabled, name changes)
+    channels_changed = QtCore.Signal() 
+
     
     def setup(self):
         self.display_update_period = 0.050 #seconds
@@ -78,11 +83,16 @@ class SyncRasterDAQ(HardwareComponent):
         self.ext_clock_source = self.add_logged_quantity("ext_clock_source", dtype=str, initial="/X-6368/PFI0")
         
         #parameters that cannot change during while connected
-        self.lq_lock_on_connect = ['adc_device', 'adc_channels', 'adc_chans_enable', 'adc_chan_names',
+        self.lq_lock_on_connect = self.channel_lq_names =\
+                                   ['adc_device', 'adc_channels', 'adc_chans_enable', 'adc_chan_names',
                                    'dac_device', 'dac_channels', 'dac_chans_enable', 'dac_chan_names',
                                    'ctr_device', 'ctr_channels', 'ctr_chans_enable', 'ctr_chan_names',
                                    'ctr_chan_terms', 'trig_output_term',
                                    ]
+       
+        # send channels_changed signal on change of these lq's
+        for lq_name in self.channel_lq_names:
+            self.settings.get_lq(lq_name).add_listener(lambda: self.channels_changed.emit())
        
         self.settings.adc_rate.add_listener(self.compute_dac_rate)
         self.settings.adc_oversample.add_listener(self.compute_dac_rate)
