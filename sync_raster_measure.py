@@ -344,11 +344,11 @@ class SyncRasterScan(BaseRaster2DScan):
         finally:
             self.in_dac_callback = False
             self.dac_callback_elapsed = time.time() - self.dac_callback_elapsed
-            print("DAQ elapsed time {:.3g} ms {}% frame write pos {:d} space {:d} samples {:d}"\
-                  .format(self.dac_callback_elapsed*1e3, self.dac_percent_frame,\
-                          self.write_pos.value,\
-                          self.space_available.value,\
-                          self.samples_generated.value))
+#             print("DAQ elapsed time {:.3g} ms {}% frame write pos {:d} space {:d} samples {:d}"\
+#                   .format(self.dac_callback_elapsed*1e3, self.dac_percent_frame,\
+#                           self.write_pos.value,\
+#                           self.space_available.value,\
+#                           self.samples_generated.value))
 
         return 0
     
@@ -361,7 +361,7 @@ class SyncRasterScan(BaseRaster2DScan):
             
     def done_callback_func_adc(self, status):
         self.task_done = True
-        print("done", status)
+        #print("done", status)
         return 0
     
     def handle_new_data(self):
