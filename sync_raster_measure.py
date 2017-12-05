@@ -10,11 +10,16 @@ from ScopeFoundry.scanning import BaseRaster2DScan
 from ScopeFoundry import h5_io
 import numpy as np
 import time
-from ScopeFoundry.helper_funcs import load_qt_ui_file, sibling_path
+from ScopeFoundry.helper_funcs import load_qt_ui_file, sibling_path,\
+    replace_spinbox_in_layout
 from ctypes import c_int32, c_uint32, c_uint64, byref
 import PyDAQmx as mx
 from .drift_correction import register_translation_hybrid
 from ScopeFoundry.logged_quantity import LoggedQuantity, LQCollection
+from collections import OrderedDict, namedtuple
+
+AvailChan = namedtuple('AvailChan', ['type_', 'index', 'phys_chan', 'chan_name', 'term'])
+
 
 class SyncRasterScan(BaseRaster2DScan):
 
@@ -30,6 +35,7 @@ class SyncRasterScan(BaseRaster2DScan):
                 
         self.display_update_period = 0.050 #seconds
         
+        self.settings.New('adc_rate', dtype=float,initial = 500e3, unit='Hz')
         self.settings.New("adc_oversample", dtype=int, 
                             initial=1, 
                             vmin=1, vmax=1e10,
@@ -54,15 +60,40 @@ class SyncRasterScan(BaseRaster2DScan):
         
         self.settings.n_frames.connect_to_widget(self.details_ui.n_frames_doubleSpinBox)
         self.settings.adc_oversample.connect_to_widget(self.details_ui.adc_oversample_doubleSpinBox)
+        #self.settings.adc_rate.connect_to_widget(self.details_ui.adc_rate_doubleSpinBox)
+        self.details_ui.adc_rate_pgSpinBox = \
+            replace_spinbox_in_layout(self.details_ui.adc_rate_doubleSpinBox)
+        self.settings.adc_rate.connect_to_widget(
+            self.details_ui.adc_rate_pgSpinBox)
         self.settings.display_chan.connect_to_widget(self.details_ui.display_chan_comboBox)
+        
+        self.details_ui.pixel_time_pgSpinBox = \
+            replace_spinbox_in_layout(self.details_ui.pixel_time_doubleSpinBox)
+        self.settings.pixel_time.connect_to_widget(
+            self.details_ui.pixel_time_pgSpinBox)
+        
+        self.details_ui.line_time_pgSpinBox = \
+            replace_spinbox_in_layout(self.details_ui.line_time_doubleSpinBox)
+        self.settings.line_time.connect_to_widget(
+            self.details_ui.line_time_pgSpinBox)
+        
+        self.details_ui.frame_time_pgSpinBox = \
+            replace_spinbox_in_layout(self.details_ui.frame_time_doubleSpinBox)
+        self.settings.frame_time.connect_to_widget(
+            self.details_ui.frame_time_pgSpinBox)
+
         
         self.scanDAQ.settings.dac_rate.add_listener(self.compute_times)
         self.settings.Nh.add_listener(self.compute_times)
         self.settings.Nv.add_listener(self.compute_times)
         
+        
         if hasattr(self.app,'sem_remcon'):#FIX re-implement later
             self.sem_remcon=self.app.sem_remcon
         
+        S = self.settings
+        self.settings.pixel_time.connect_lq_math([S.adc_rate,S.adc_oversample],
+                                                 lambda rate, oversample: oversample/rate)
         
 #     def dock_config(self):
 #         
@@ -77,6 +108,12 @@ class SyncRasterScan(BaseRaster2DScan):
 #         
 # 
 #     WIP
+
+    def pre_run(self):
+        self.scanDAQ = self.app.hardware['sync_raster_daq']        
+        self.scanDAQ.settings['adc_rate'] = self.settings['adc_rate']
+        self.scanDAQ.settings['adc_oversample'] = self.settings['adc_oversample']
+
     
     def run(self):
         
@@ -92,7 +129,6 @@ class SyncRasterScan(BaseRaster2DScan):
             # measurement thread continues
             time.sleep(0.2)
             
-        self.scanDAQ.settings['adc_oversample'] = self.settings['adc_oversample']
         
             # READ FROM HARDWARE BEFORE SCANNING -- Drift correction depends on accurate numbers
             # also disable beam blank, enable ext scan
@@ -588,9 +624,22 @@ class SyncRasterScan(BaseRaster2DScan):
                 return False
         else:
             return False
+    
+#     def compute_times(self):
+#         #if hasattr(self, 'scanDAQ'):
+#         dac_rate = self.settings['adc_rate']*self.settings['adc_oversample']
+#         self.settings['pixel_time'] = 1.0/dac_rate
+#         BaseRaster2DScan.compute_times(self)
+
+    def update_available_channels(self):
+        self.available_chan_dict = OrderedDict()
                 
-    def compute_times(self):
-        if hasattr(self, 'scanDAQ'):
-            self.settings['pixel_time'] = 1.0/self.scanDAQ.settings['dac_rate']
-        BaseRaster2DScan.compute_times(self)
+        for i, phys_chan in enumerate(self.scanDAQ.settings['adc_channels']):
+            self.available_chan_dict[phys_chan] = AvailChan(
+                # type, index, physical_chan, channel_name, terminal
+                'ai', i, phys_chan, self.scanDAQ.settings['adc_chan_names'][i], phys_chan)
+        for i, phys_chan in enumerate(self.scanDAQ.settings['ctr_channels']):
+            self.available_chan_dict[phys_chan] = AvailChan(
+                # type, index, physical_chan, channel_name, terminal
+                'ctr', i, phys_chan, self.scanDAQ.settings['ctr_chan_names'][i], self.scanDAQ.settings['ctr_chan_terms'][i])
 

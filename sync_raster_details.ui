@@ -14,15 +14,35 @@
    <string>Form</string>
   </property>
   <layout class="QGridLayout" name="gridLayout">
-   <item row="0" column="1">
-    <widget class="QDoubleSpinBox" name="n_frames_doubleSpinBox"/>
+   <item row="1" column="0">
+    <widget class="QLabel" name="label_4">
+     <property name="text">
+      <string>ADC Rate</string>
+     </property>
+    </widget>
    </item>
-   <item row="2" column="0">
+   <item row="1" column="1">
+    <widget class="QDoubleSpinBox" name="adc_rate_doubleSpinBox"/>
+   </item>
+   <item row="3" column="0">
     <widget class="QLabel" name="label_3">
      <property name="text">
       <string>Display Channel</string>
      </property>
     </widget>
+   </item>
+   <item row="2" column="0">
+    <widget class="QLabel" name="label_2">
+     <property name="text">
+      <string>ADC Oversample</string>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="1">
+    <widget class="QDoubleSpinBox" name="adc_oversample_doubleSpinBox"/>
+   </item>
+   <item row="0" column="1">
+    <widget class="QDoubleSpinBox" name="n_frames_doubleSpinBox"/>
    </item>
    <item row="0" column="0">
     <widget class="QLabel" name="label">
@@ -31,18 +51,38 @@
      </property>
     </widget>
    </item>
-   <item row="1" column="1">
-    <widget class="QDoubleSpinBox" name="adc_oversample_doubleSpinBox"/>
+   <item row="3" column="1">
+    <widget class="QComboBox" name="display_chan_comboBox"/>
    </item>
-   <item row="1" column="0">
-    <widget class="QLabel" name="label_2">
+   <item row="4" column="1">
+    <widget class="QDoubleSpinBox" name="pixel_time_doubleSpinBox"/>
+   </item>
+   <item row="5" column="1">
+    <widget class="QDoubleSpinBox" name="line_time_doubleSpinBox"/>
+   </item>
+   <item row="6" column="1">
+    <widget class="QDoubleSpinBox" name="frame_time_doubleSpinBox"/>
+   </item>
+   <item row="4" column="0">
+    <widget class="QLabel" name="label_5">
      <property name="text">
-      <string>ADC Oversample</string>
+      <string>Pixel Time</string>
      </property>
     </widget>
    </item>
-   <item row="2" column="1">
-    <widget class="QComboBox" name="display_chan_comboBox"/>
+   <item row="5" column="0">
+    <widget class="QLabel" name="label_6">
+     <property name="text">
+      <string>Line Time</string>
+     </property>
+    </widget>
+   </item>
+   <item row="6" column="0">
+    <widget class="QLabel" name="label_7">
+     <property name="text">
+      <string>Frame Time</string>
+     </property>
+    </widget>
    </item>
   </layout>
  </widget>
