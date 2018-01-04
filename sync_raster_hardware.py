@@ -188,6 +188,7 @@ class SyncRasterDAQ(HardwareComponent):
     
     def compute_dac_rate(self):
         self.settings['dac_rate'] = self.settings['adc_rate']/self.settings['adc_oversample']
+        return self.settings['dac_rate']
     
     def setup_io_with_data(self, X, Y):
         """

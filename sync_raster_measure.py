@@ -113,6 +113,7 @@ class SyncRasterScan(BaseRaster2DScan):
         self.scanDAQ = self.app.hardware['sync_raster_daq']        
         self.scanDAQ.settings['adc_rate'] = self.settings['adc_rate']
         self.scanDAQ.settings['adc_oversample'] = self.settings['adc_oversample']
+        self.scanDAQ.compute_dac_rate()
 
     
     def run(self):
@@ -130,8 +131,8 @@ class SyncRasterScan(BaseRaster2DScan):
             time.sleep(0.2)
             
         
-            # READ FROM HARDWARE BEFORE SCANNING -- Drift correction depends on accurate numbers
-            # also disable beam blank, enable ext scan
+        # READ FROM HARDWARE BEFORE SCANNING -- Drift correction depends on accurate numbers
+        # also disable beam blank, enable ext scan
         self.app.hardware['sem_remcon'].read_from_hardware()
         self.app.hardware['sem_remcon'].settings['external_scan'] = 1
         self.app.hardware['sem_remcon'].settings['beam_blanking'] = 0
