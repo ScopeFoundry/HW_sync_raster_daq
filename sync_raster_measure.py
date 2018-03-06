@@ -532,6 +532,11 @@ class SyncRasterScan(BaseRaster2DScan):
         self.ctr_total_pixel_index[ctr_i] += dii
         self.ctr_pixel_index[ctr_i] %= self.Npixels
         
+        # copy pixel 1 to pixel 0 to avoid large count number 
+        # from free-running counter between measurements
+        if ii == 0 and dii > 1:
+            new_data[0] = new_data[1]
+        
         # copy data to image shaped map
         x = self.scan_index_array[ii:ii+dii,:].T
         self.ctr_map[x[0], x[1], x[2], ctr_i] = new_data
