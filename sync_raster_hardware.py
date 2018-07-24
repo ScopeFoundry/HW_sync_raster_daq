@@ -75,7 +75,7 @@ class SyncRasterDAQ(HardwareComponent):
                  
         
         self.ext_clock_enable = self.add_logged_quantity("ext_clock_enable", dtype=bool, initial=False)
-        self.ext_clock_source = self.add_logged_quantity("ext_clock_source", dtype=str, initial="/X-6368/PFI0")
+        self.ext_clock_source = self.add_logged_quantity("ext_clock_source", dtype=str, initial="/X-6363/PFI0")
         
         #parameters that cannot change during while connected
         self.lq_lock_on_connect = ['adc_device', 'adc_channels', 'adc_chans_enable', 'adc_chan_names',
