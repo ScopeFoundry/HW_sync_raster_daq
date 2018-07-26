@@ -52,6 +52,7 @@ class SyncRasterScan(BaseRaster2DScan):
         
         self.scanDAQ = self.app.hardware['sync_raster_daq']        
         self.scan_on=False
+        self.read_from_hardware=True #Disabling allows fast repeated "single scans"
         
         self.details_ui = load_qt_ui_file(sibling_path(__file__, 'sync_raster_details.ui'))
         self.ui.details_groupBox.layout().addWidget(self.details_ui) # comment out?
@@ -118,22 +119,26 @@ class SyncRasterScan(BaseRaster2DScan):
     
     def run(self):
         
+        self.frame_time_i = time.time()
+        
         self.on_start_of_run()
         
         self.adc_poll_period = 0.050
         
         # if hardware is not connected, connect it
-        time.sleep(0.5)
+        #time.sleep(0.5)
         if not self.scanDAQ.settings['connected']:
             self.scanDAQ.settings['connected'] = True
             # we need to wait while the task is created before 
             # measurement thread continues
-            time.sleep(0.2)
+            time.sleep(0.1)
             
         
-        # READ FROM HARDWARE BEFORE SCANNING -- Drift correction depends on accurate numbers
-        # also disable beam blank, enable ext scan
-        self.app.hardware['sem_remcon'].read_from_hardware()
+
+            # READ FROM HARDWARE BEFORE SCANNING -- Drift correction depends on accurate numbers
+            # also disable beam blank, enable ext scan
+        if self.read_from_hardware:
+            self.app.hardware['sem_remcon'].read_from_hardware()
         self.app.hardware['sem_remcon'].settings['external_scan'] = 1
         self.app.hardware['sem_remcon'].settings['beam_blanking'] = 0
        
@@ -246,23 +251,27 @@ class SyncRasterScan(BaseRaster2DScan):
             
                         
             ##### register callbacks
-            self.scanDAQ.set_n_pixel_callback_adc(
-                num_pixels_per_block, 
-                self.every_n_callback_func_adc)
-            
-            self.scanDAQ.set_n_pixel_callback_dac(
-                self.num_pixels_per_dac_block,
-                self.every_n_callback_func_dac)
-            
-            self.scanDAQ.sync_analog_io.adc.set_done_callback(
-                self.done_callback_func_adc )
-            
-            self.dac_i = 0
-            
-            for ctr_i in range(self.scanDAQ.num_ctrs):
-                self.scanDAQ.set_ctr_n_pixel_callback( ctr_i,
-                        num_pixels_per_block, lambda i=ctr_i: self.every_n_callback_func_ctr(i))
-            
+            if hasattr(self.scanDAQ.sync_analog_io, 'sync_raster_scan_callbacks'):
+                print("callbacks already defined")
+            else:
+                self.scanDAQ.set_n_pixel_callback_adc(
+                    num_pixels_per_block, 
+                    self.every_n_callback_func_adc)
+                
+                self.scanDAQ.set_n_pixel_callback_dac(
+                    self.num_pixels_per_dac_block,
+                    self.every_n_callback_func_dac)
+                
+                self.scanDAQ.sync_analog_io.adc.set_done_callback(
+                    self.done_callback_func_adc )
+                
+                self.dac_i = 0
+                
+                for ctr_i in range(self.scanDAQ.num_ctrs):
+                    self.scanDAQ.set_ctr_n_pixel_callback( ctr_i,
+                            num_pixels_per_block, lambda i=ctr_i: self.every_n_callback_func_ctr(i))
+
+                self.scanDAQ.sync_analog_io.sync_raster_scan_callbacks = True
             
             self.pre_scan_setup()
 
@@ -285,7 +294,11 @@ class SyncRasterScan(BaseRaster2DScan):
                 self.log.info('data saved to {}'.format(self.h5_file.filename))
                 self.h5_file.close()            
             self.scanDAQ.stop()
+            
+            ##### TODO unregister callbacks
             self.scanDAQ.settings['connected']=False
+            
+            
             # TODO disconnect callback
             #self.scanDAQ.
             #print("Npixels", self.Npixels, 'block size', self.num_pixels_per_block, 'num_blocks', num_blocks)
@@ -302,6 +315,8 @@ class SyncRasterScan(BaseRaster2DScan):
                 self.settings['v1'] -= self.dac_offsets[-1][1]
             
             self.post_scan_cleanup()
+            
+            print(self.name, "done")
 
         
     
@@ -465,6 +480,9 @@ class SyncRasterScan(BaseRaster2DScan):
         pass
     
     def on_end_frame(self, frame_i):
+        if hasattr(self, "frame_time_i"):
+            print("sync_raster_scan frame_time", time.time() - self.frame_time_i)
+        self.frame_time_i = time.time()
         
         if self.settings['correct_drift']:
             frame_num = frame_i
