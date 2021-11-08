@@ -1,4 +1,4 @@
-from skimage.feature.register_translation import _upsampled_dft, _compute_error, _compute_phasediff
+#from skimage.feature.phase_cross_correlation  import _upsampled_dft, _compute_error, _compute_phasediff
 import numpy as np
 
 def register_translation_hybrid(src_image, target_image, exponent = 1, upsample_factor=1,
